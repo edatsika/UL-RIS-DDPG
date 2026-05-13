@@ -1,130 +1,175 @@
+#pragma once
 #include <torch/torch.h>
 #include <vector>
-#include <iostream>
 #include <cmath>
+#include <stdexcept>
+
+//  VectorizedEnvironment
+
+//     Configurable vec_size (batch dimension) set at construction.
+
+//     reset() / step() always work on [vec_size, ...] tensors,
+//     so the agent performs ONE forward pass for all sub-envs at
+//     once instead of N sequential single-env passes.
+
+//     reset() accepts an optional override so you can reset a
+//     single vec_size-1 environment without rebuilding the object.
+
+//     step() returns done as a [B] bool tensor; the caller checks
+//     per-environment termination and resets selectively.
 
 class Environment {
 public:
-    int num_users, num_ris, num_elements;
-    int state_dim, action_dim;
-    double bandwidth;
+    const int    num_users;
+    const int    num_ris;
+    const int    num_elements;
+    const double bandwidth;
+    const int    vec_size;   // vectorised batch size
 
-    // Complex-valued tensors represented with real and imag parts
+    int state_dim;
+    int action_dim;
+
+    // Channel matrices  [B, K, M, N]
     torch::Tensor g_km_real, g_km_imag;
     torch::Tensor h_km_real, h_km_imag;
-    torch::Tensor theta_kmn_real, theta_kmn_imag;
 
+    // State variables
+    torch::Tensor theta_kmn_real, theta_kmn_imag; // [B, K, M, N]
     torch::Tensor snr_km;      // [B, K, M]
     torch::Tensor u_km;        // [B, K, M]
     torch::Tensor tau_sched;   // [B, K]
     torch::Tensor rho_k;       // [B, K]
 
-    Environment(int num_users_, int num_ris_, int num_elements_, double bandwidth_)
-        : num_users(num_users_), num_ris(num_ris_), num_elements(num_elements_), bandwidth(bandwidth_) {
-        
-        state_dim = num_users * num_ris   // snr_km
-                  + num_users * num_ris   // u_km
-                  + num_users             // tau_sched
-                  + num_users;            // rho_k
+    //  Constructor
+    //  vec_size=1: identical to the original single-env mode.
+    //  vec_size>1: vectorised; all tensors gain a batch dim.
 
-        action_dim = 2 * num_users                          // rho_k + tau_sched
-                   + 2 * num_users * num_ris * num_elements // theta_kmn (real + imag)
-                   + num_users * num_ris;                   // u_km
+    Environment(int num_users_, int num_ris_, int num_elements_,
+                double bandwidth_, int vec_size_ = 1)
+        : num_users(num_users_)
+        , num_ris(num_ris_)
+        , num_elements(num_elements_)
+        , bandwidth(bandwidth_)
+        , vec_size(vec_size_)
+    {
+        if (vec_size < 1)
+            throw std::invalid_argument("vec_size must be >= 1");
+
+        state_dim =
+            num_users * num_ris   // snr_km  (flattened)
+          + num_users * num_ris   // u_km
+          + num_users             // tau_sched
+          + num_users;            // rho_k
+
+        action_dim =
+            2 * num_users                            // rho_k + tau_sched
+          + 2 * num_users * num_ris * num_elements   // theta_kmn (real + imag)
+          + num_users * num_ris;                     // u_km
     }
 
-    // 	Initialized real & imag parts of g_km, h_km, theta_kmn
-    torch::Tensor reset() {
-        int batch_size = 1;
+    //  reset:  returns state tensor  [B, state_dim]
 
-        g_km_real = torch::rand({batch_size, num_users, num_ris, num_elements});
-        g_km_imag = torch::rand({batch_size, num_users, num_ris, num_elements});
-        h_km_real = torch::rand({batch_size, num_users, num_ris, num_elements});
-        h_km_imag = torch::rand({batch_size, num_users, num_ris, num_elements});
+    //  Randomises channel matrices and initial state for all B sub-envs in one batched call
+    torch::Tensor reset(int override_batch = -1) {
+        int B = (override_batch > 0) ? override_batch : vec_size;
 
-        snr_km = torch::zeros({batch_size, num_users, num_ris});
-        u_km = torch::zeros({batch_size, num_users, num_ris});
-        tau_sched = torch::rand({batch_size, num_users});
-        rho_k = torch::rand({batch_size, num_users});
-        theta_kmn_real = torch::rand({batch_size, num_users, num_ris, num_elements});
-        theta_kmn_imag = torch::rand({batch_size, num_users, num_ris, num_elements});
+        // Channel matrices – fixed per episode, randomised at reset
+        g_km_real = torch::rand({B, num_users, num_ris, num_elements});
+        g_km_imag = torch::rand({B, num_users, num_ris, num_elements});
+        h_km_real = torch::rand({B, num_users, num_ris, num_elements});
+        h_km_imag = torch::rand({B, num_users, num_ris, num_elements});
 
-        for (int k = 0; k < num_users; ++k) {
-            int random_ris = std::rand() % num_ris;
-            u_km[0][k][random_ris] = 1;
-        }
+        // State variables
+        snr_km       = torch::zeros({B, num_users, num_ris});
+        u_km         = torch::zeros({B, num_users, num_ris});
+        tau_sched    = torch::rand ({B, num_users});
+        rho_k        = torch::rand ({B, num_users});
+        theta_kmn_real = torch::rand({B, num_users, num_ris, num_elements});
+        theta_kmn_imag = torch::rand({B, num_users, num_ris, num_elements});
+
+        // Assign each user a random initial RIS via scatter
+        // u_km[b, k, rand_ris] = 1  for all b, k
+        // scatter_() requires a Long index tensor
+        auto rand_ris = torch::randint(0, num_ris, {B, num_users},
+                                       torch::dtype(torch::kLong));     // [B, K] int64
+        u_km.scatter_(/*dim=*/2,
+                      rand_ris.unsqueeze(2),                            // [B, K, 1] int64
+                      torch::ones({B, num_users, 1}));
 
         return get_state();
     }
 
-    torch::Tensor get_state() {
-        auto snr_flat = snr_km.flatten(1);
-        auto u_flat = u_km.flatten(1);
-        return torch::cat({snr_flat, u_flat, tau_sched, rho_k}, 1);
+
+    //  get_state: [B, state_dim]  (flat concatenation)
+  
+    torch::Tensor get_state() const {
+        return torch::cat({
+            snr_km.flatten(1),   // [B, K*M]
+            u_km.flatten(1),     // [B, K*M]
+            tau_sched,           // [B, K]
+            rho_k                // [B, K]
+        }, /*dim=*/1);
     }
 
-    // Parses and reshapes real/imag parts from action tensor
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> step(torch::Tensor action) {
-        int batch_size = action.size(0);
+    //  step: {next_state [B,S], reward [B], done [B]}
 
-        auto rho_k_ = action.slice(1, 0, num_users).clone();  // [B, K]
-        auto tau_sched_ = action.slice(1, num_users, 2 * num_users).clone();  // [B, K]
+    //  action shape: [B, action_dim]  (sigmoid-scaled [0,1])
 
-        int theta_start = 2 * num_users;
-        int theta_len = 2 * num_users * num_ris * num_elements;
-        int theta_end = theta_start + theta_len;
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+    step(torch::Tensor action)
+    {
+        const int B    = action.size(0);
+        const int KMN  = num_users * num_ris * num_elements;
 
-        auto theta_kmn_flat = action.slice(1, theta_start, theta_end).clone();
+        // ---- Parse action tensor ----
+        int off = 0;
 
-        int half_len = theta_len / 2;
+        rho_k     = action.narrow(1, off, num_users).clone();          off += num_users;
+        tau_sched = action.narrow(1, off, num_users).clone();          off += num_users;
 
-        theta_kmn_real = theta_kmn_flat.slice(1, 0, half_len)
-                         .reshape({batch_size, num_users, num_ris, num_elements});
-        theta_kmn_imag = theta_kmn_flat.slice(1, half_len, theta_len)
-                         .reshape({batch_size, num_users, num_ris, num_elements});
+        theta_kmn_real = action.narrow(1, off, KMN)
+                              .reshape({B, num_users, num_ris, num_elements}).clone();
+        off += KMN;
+        theta_kmn_imag = action.narrow(1, off, KMN)
+                              .reshape({B, num_users, num_ris, num_elements}).clone();
+        off += KMN;
 
-        int u_start = theta_end;
-        int u_end = action.size(1);
-        auto u_km_flat = action.slice(1, u_start, u_end).clone();
-        u_km = u_km_flat.reshape({batch_size, num_users, num_ris});
+        u_km = action.narrow(1, off, num_users * num_ris)
+                     .reshape({B, num_users, num_ris}).clone();
 
-        rho_k = rho_k_;
-        tau_sched = tau_sched_;
-
+        //  Compute next state
         snr_km = calculate_snr();
-        torch::Tensor reward = calculate_reward();
-        auto done = reward > 100.0;
+
+        torch::Tensor reward = calculate_reward();          // [B]
+        // episodes run for a fixed number of steps (controlled by max_steps in the collector)
+        // done is always false so the agent never resets mid-episode due to reward magnitude
+        torch::Tensor done = torch::zeros({B}, torch::kBool);
 
         return {get_state(), reward, done};
     }
 
 private:
+    //  SNR  =  rho_k * |theta o (g * h)|^2  /  noise_floor
     torch::Tensor calculate_snr() {
-        auto theta_r = theta_kmn_real;
-        auto theta_i = theta_kmn_imag;
-        auto gr = g_km_real;
-        auto gi = g_km_imag;
-        auto hr = h_km_real;
-        auto hi = h_km_imag;
+        // Complex product: (gr + j gi)(hr + j hi)
+        auto gh_r = g_km_real * h_km_real - g_km_imag * h_km_imag;
+        auto gh_i = g_km_real * h_km_imag + g_km_imag * h_km_real;
 
-        // g*h = (gr + jgi)(hr + jhi)
-        auto gh_r = gr * hr - gi * hi;
-        auto gh_i = gr * hi + gi * hr;
+        // theta * (g*h)
+        auto prod_r = theta_kmn_real * gh_r - theta_kmn_imag * gh_i;
+        auto prod_i = theta_kmn_real * gh_i + theta_kmn_imag * gh_r;
 
-        // theta_ * (g*h)
-        auto real = theta_r * gh_r - theta_i * gh_i;
-        auto imag = theta_r * gh_i + theta_i * gh_r;
+        auto power       = prod_r.pow(2) + prod_i.pow(2);  // [B, K, M, N]
+        auto channel_gain = power.sum(-1);                  // [B, K, M]
+        auto rho_exp     = rho_k.unsqueeze(2);              // [B, K, 1]
 
-        auto power = real.pow(2) + imag.pow(2);  // |z|^2
-        auto channel_gain = power.sum(-1);       // [B, K, M]
-        auto rho_expanded = rho_k.unsqueeze(2);  // [B, K, 1]
-
-        return (rho_expanded * channel_gain) / 1e-3;
+        return (rho_exp * channel_gain) / 1e-3;             // [B, K, M]
     }
 
+    //  Reward  =  sum_{k,m}  u_km * tau_k * B * log2(1 + SNR)
     torch::Tensor calculate_reward() {
-        auto tau_expanded = tau_sched.unsqueeze(2);  // [B, K, 1]
-        auto rate = u_km * tau_expanded * bandwidth * torch::log2(1 + snr_km);
-        auto sum_rate = rate.sum({1, 2});  // [B]
-        return sum_rate;
+        auto tau_exp = tau_sched.unsqueeze(2);              // [B, K, 1]
+        auto rate    = u_km * tau_exp * bandwidth * torch::log2(1.0f + snr_km);
+        return rate.sum({1, 2}) / bandwidth;                            // [B]
     }
 };
