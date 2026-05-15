@@ -14,7 +14,7 @@ A C++ reinforcement learning framework that applies **Deep Deterministic Policy 
 - [Requirements](#requirements)
 - [Configuration](#configuration)
 - [Results](#results)
-- [Next Steps](#next-steps)
+- [Changes log](#changes-log)
 
 ---
 
@@ -167,30 +167,50 @@ All hyperparameters are `constexpr` constants in `main.cpp`.
 | `vec_size` | 4 | Vectorised sub-environments per thread |
 | `max_steps` | 50 | Steps per episode |
 | `train_iters` | 2000 | Total training gradient steps |
-| `batch_size` | 64 | Mini-batch size |
-| `buf_capacity` | 20 000 | Replay buffer capacity |
+| `batch_size` | 256 | Mini-batch size |
+| `buf_capacity` | 50 000 | Replay buffer capacity |
 | `actor_lr` | 5e-5 | Actor learning rate |
 | `critic_lr` | 1e-4 | Critic learning rate |
-| `tau` | 1e-3 | Soft update coefficient |
+| `tau` | 5e-4 | Soft update coefficient |
 | `gamma` | 0.99 | Discount factor |
 
 ---
 
 ## Results
 
-In the following examlpe Training converges with a consistent upward trend in both episode reward and Q-value estimates. Example run (`K=5, M=2, N=32`):
+Training converges with a consistent upward trend in both episode reward and Q-value estimates. Example run (`K=5, M=2, N=32`):
 
 ```
-Step    0 | Episodes:    3 | Avg Ep Reward:   497 | A-Loss:   -26 | C-Loss:  28580 | Avg Q:   -65
-Step  500 | Episodes:  624 | Avg Ep Reward:  5174 | A-Loss: -2047 | C-Loss:   5680 | Avg Q:  2050
-Step 1000 | Episodes: 1308 | Avg Ep Reward:  6330 | A-Loss: -2435 | C-Loss:   6722 | Avg Q:  2403
-Step 1500 | Episodes: 2107 | Avg Ep Reward:  6730 | A-Loss: -2912 | C-Loss:  15438 | Avg Q:  2932
-Step 1950 | Episodes: 2799 | Avg Ep Reward:  6893 | A-Loss: -3259 | C-Loss:   7337 | Avg Q:  3251
-```
 
+| Step | Episodes | Avg Ep Reward | A-Loss | C-Loss | Avg Q |
+|-----:|--------:|-------------:|-------:|-------:|------:|
+|    0 |       0 |            0 |    153 |    529 |  -194 |
+|  500 |      96 |         3623 |   -622 |     78 |   619 |
+| 1000 |     224 |         4483 |   -935 |    119 |   911 |
+| 1500 |     346 |         5376 |  -1776 |    150 |  1815 |
+| 1950 |     448 |         5757 |  -2589 |     96 |  2562 |
+| 5000 |    1159 |         6593 |  -4242 |     53 |  4232 |
+| 9950 |    2461 |         6883 |  -6754 |     59 |  6714 |
+```
 
 ---
 
-## Next Steps
+## Changes log
 
-Since the training step is the throughput bottleneck, profiling shows collectors generate data faster than the trainer consumes it, meaning additional collector threads add contention on `actor_rw_` without meaningful gain, the most impactful parallelism improvements target the update loop itself. Two directions are viable on CPU. First, **data-parallel gradient computation**: split each mini-batch into N equal sub-batches, compute forward and backward passes concurrently on separate threads, then reduce the resulting gradients before calling `optimizer.step()` This scales linearly with available cores up to the point where synchronisation overhead dominates. Second, **pipelined actor/critic updates**: because the critic update does not require the actor lock, critic and actor gradient steps can be overlapped across consecutive training iterations on two dedicated threads, with careful read/write ordering on the shared critic weights, this halves the effective latency of each update at the cost of introducing a one-step lag between the critic seen by the actor and the critic seen by the Bellman target.
+### Thread Safety
+
+- Data race on Actor/Critic weights between `select_action()` and `update()`: `std::shared_mutex`: `shared_lock` for collectors, `unique_lock` for trainer 
+- Concurrent `buffer.add()` from multiple collectors: `write_mtx_` for metadata + `stripe_mtx_[16]` for individual slots 
+- Concurrent `buffer.sample()` during `add()`: Per-slot `stripe_mtx_` + dedicated `rng_mtx_` 
+- Deadlock on training end: `sample()` blocked in `cv_.wait()` indefinitely: `notify_stop()` wakes all waiters; `stop_flag` checked in `cv_.wait` 
+- Shared `OUNoise` across all collector threads and serialised sampling, correlated exploration: one `OUNoise` instance per sub-environment, owned by its collector thread, mutex removed 
+- Identical noise added to all `vec_size` environments per step via `expand_as()`: per-environment noise sampled independently, stacked into `[B, action_dim]` tensor
+
+<!-- ### Training Stability
+
+- Critic loss: `mse_loss` → `smooth_l1_loss` (Huber): MSE amplifies large TD errors quadratically, causing critic loss spikes up to 515k; Huber clips gradient magnitude for large errors
+- `batch_size`: 64 → 256: more stable gradient estimates for 660-dimensional action space; reduces variance per update step 
+- `buf_capacity`: 20k → 50k: prevents recent experiences from overwriting older ones too quickly; improves sample diversity
+- `actor_lr`: 5e-5 → 5e-6  Slows actor relative to critic, reducing Q-value divergence 
+- `critic_lr`: 1e-4 → 1e-4 (unchanged): Huber loss already stabilises critic; aggressive lr no longer needed to chase spikes
+- `tau`: 1e-3 → 5e-4: Slower target network updates reduce bootstrap instability-->
