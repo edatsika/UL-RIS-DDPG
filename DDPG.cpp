@@ -7,8 +7,6 @@
 #include <random>
 #include <atomic>
 
-
-// Data Structures
 struct Experience {
     torch::Tensor state;
     torch::Tensor action;
@@ -20,10 +18,9 @@ struct Experience {
 struct TrainingMetrics {
     float actor_loss;
     float critic_loss;
-    float avg_q_value;      // Added for monitoring
-    float avg_reward;       // Added for monitoring
+    float avg_q_value;      
+    float avg_reward;       
 };
-
 
 class ReplayBuffer {
 public:
@@ -32,6 +29,7 @@ public:
           current_size_(0), rng_(std::random_device{}()) {}
 
     void add(torch::Tensor state, torch::Tensor action, torch::Tensor next_state, float reward, bool done) {
+        // Clone out of lock
         Experience exp{state.clone(), action.clone(), next_state.clone(), reward, done};
         size_t slot;
         {
@@ -40,32 +38,47 @@ public:
             ++write_pos_;
             if (current_size_ < max_size_) ++current_size_;
             total_collected_.fetch_add(1, std::memory_order_relaxed);
+            reward_sum_ += reward; 
         }
         {
             std::lock_guard<std::mutex> lk(stripe_mtx_[slot % 16]);
             buffer_[slot] = std::move(exp);
         }
-        cv_.notify_one();
+        cv_.notify_all(); 
     }
 
-    std::vector<Experience> sample(size_t batch_size) {
+    // Use stop flag to avoid deadlocks
+    std::vector<Experience> sample(size_t batch_size, std::atomic<bool>& stop_flag) {
         size_t cur;
         {
             std::unique_lock<std::mutex> lk(write_mtx_);
-            cv_.wait(lk, [&]{ return current_size_ >= batch_size; });
+            cv_.wait(lk, [&]{ return current_size_ >= batch_size || stop_flag.load(std::memory_order_relaxed); });
+            
+            if (stop_flag.load(std::memory_order_relaxed) && current_size_ < batch_size) {
+                return {}; 
+            }
             cur = current_size_;
         }
+        
         std::vector<size_t> idx(batch_size);
         {
             std::lock_guard<std::mutex> lk(rng_mtx_);
             std::uniform_int_distribution<size_t> dist(0, cur - 1);
             for (auto& i : idx) i = dist(rng_);
         }
+        
         std::vector<Experience> batch;
         batch.reserve(batch_size);
         for (size_t i : idx) {
             std::lock_guard<std::mutex> lk(stripe_mtx_[i % 16]);
-            batch.push_back(buffer_[i]);
+            // Clone when reading from buffer
+            batch.push_back({
+                buffer_[i].state.clone(),
+                buffer_[i].action.clone(),
+                buffer_[i].next_state.clone(),
+                buffer_[i].reward,
+                buffer_[i].done
+            });
         }
         return batch;
     }
@@ -77,19 +90,22 @@ public:
     long get_total_collected() const { 
         return total_collected_.load(std::memory_order_relaxed); 
     }
-
     float get_avg_reward() const {
         std::lock_guard<std::mutex> lk(write_mtx_);
         long total = total_collected_.load(std::memory_order_relaxed);
         return (total > 0) ? (reward_sum_ / total) : 0.0f;
     }
+    void notify_stop() {
+    cv_.notify_all(); // wake up sleeping sample
+    }
+
 private:
     size_t max_size_;
     std::vector<Experience> buffer_;
     size_t write_pos_;
     size_t current_size_;
     std::atomic<long> total_collected_{0}; 
-    float reward_sum_{0.0f};  // Track rewards
+    float reward_sum_{0.0f};  
     mutable std::mutex write_mtx_;
     mutable std::mutex stripe_mtx_[16];
     std::mutex rng_mtx_;
@@ -97,7 +113,6 @@ private:
     std::mt19937 rng_;
 };
 
-// Ornstein-Uhlenbeck noise for exploration
 class OUNoise {
 public:
     OUNoise(int size, float mu = 0.0f, float theta = 0.15f, float sigma = 0.2f)
@@ -105,7 +120,6 @@ public:
           state_(size, mu), rng_(std::random_device{}()) {}
 
     std::vector<float> sample() {
-        std::lock_guard<std::mutex> lk(mtx_);
         std::normal_distribution<float> dist(0.0f, 1.0f);
         for (int i = 0; i < size_; ++i) {
             float dx = theta_ * (mu_ - state_[i]) + sigma_ * dist(rng_);
@@ -113,21 +127,15 @@ public:
         }
         return state_;
     }
-
     void reset() {
-        std::lock_guard<std::mutex> lk(mtx_);
         std::fill(state_.begin(), state_.end(), mu_);
     }
-
 private:
     int size_;
     float mu_, theta_, sigma_;
     std::vector<float> state_;
     std::mt19937 rng_;
-    std::mutex mtx_;
 };
-
-// NNs for actor and critic
 
 class ActorImpl : public torch::nn::Module {
 public:
@@ -165,7 +173,6 @@ public:
 };
 TORCH_MODULE(Critic);
 
-// DDPG Agent
 class DDPG {
 public:
     DDPG(int state_dim, int action_dim, double actor_lr, double critic_lr, 
@@ -176,8 +183,7 @@ public:
           critic_target_(Critic(state_dim, action_dim)),
           actor_opt_(actor_->parameters(), actor_lr), 
           critic_opt_(critic_->parameters(), critic_lr),
-          tau_(tau), gamma_(gamma), 
-          noise_(action_dim), use_noise_(use_noise) {
+          tau_(tau), gamma_(gamma) {
         
         torch::NoGradGuard ng;
         auto sp = actor_->parameters(); auto tp = actor_target_->parameters();
@@ -187,26 +193,28 @@ public:
         for (size_t i = 0; i < sc.size(); ++i) tc[i].copy_(sc[i]);
     }
 
-    torch::Tensor select_action(const torch::Tensor& state, bool add_noise = true) {
-        std::shared_lock<std::shared_mutex> lk(actor_rw_);
+    torch::Tensor select_action(const torch::Tensor& state, const torch::Tensor* noise_batch = nullptr) {
+        std::shared_lock<std::shared_mutex> lk(agent_mutex_); // Lock for agent
         torch::NoGradGuard ng;
         auto s = (state.dim() == 1) ? state.unsqueeze(0) : state;
         auto action = actor_->forward(s).detach();
 
-        // Add exploration noise
-        if (use_noise_ && add_noise) {
-           /*auto noise = noise_.sample();
-            auto noise_tensor = torch::tensor(noise).reshape(action.sizes());
-            action = torch::clamp(action + noise_tensor * 0.1f, 0.0f, 1.0f);*/
-            torch::tensor(noise_.sample())   // [660]
-            .unsqueeze(0)                    // [1, 660]
-            .expand_as(action)               // [4, 660]  
-            .contiguous();                   
+        if (noise_batch) {
+            // noise_batch already [B, action_dim]: different noise per env
+            action = torch::clamp(action + (*noise_batch) * 0.1f, 0.0f, 1.0f);
         }
+        /*if (use_noise_ && add_noise) {
+            auto n_vector = noise_.sample();
+            auto noise_tensor = torch::tensor(n_vector, torch::kFloat).unsqueeze(0).expand_as(action);
+            action = torch::clamp(action + noise_tensor * 0.1f, 0.0f, 1.0f);
+        }*/
         return action;
     }
 
     TrainingMetrics update(std::vector<Experience>& batch) {
+        // lock update as a whole to avoid actor-critic race
+        std::unique_lock<std::shared_mutex> lk(agent_mutex_);
+
         std::vector<torch::Tensor> sv, av, nsv;
         std::vector<float> rv, dv;
         for (auto& exp : batch) {
@@ -223,54 +231,49 @@ public:
         auto r = torch::tensor(rv).unsqueeze(1).to(s.dtype());
         auto d = torch::tensor(dv).unsqueeze(1).to(s.dtype());
 
-
         float c_loss_val, a_loss_val, avg_q;
 
-        // Critic Update
+        // Critic update
         {
             auto tgt_a = actor_target_->forward(ns);
             auto tgt_q = critic_target_->forward(ns, tgt_a);
             auto y = r + gamma_ * (1.0f - d) * tgt_q;
             auto q = critic_->forward(s, a);
 
-            avg_q = q.mean().item<float>();  // Monitor Q-values
+            avg_q = q.mean().item<float>();  
 
-            auto critic_loss = torch::mse_loss(q, y.detach());
+            //auto critic_loss = torch::mse_loss(q, y.detach());
+            auto critic_loss = torch::smooth_l1_loss(q, y.detach());
+            // smooth_l1 = Huber with delta=1: L2 for small errors, L1 for big errors, to avoid spikes
             c_loss_val = critic_loss.template item<float>();
             
             critic_opt_.zero_grad(); 
             critic_loss.backward(); 
 
-            // Gradient clipping for critic 
-            // torch::nn::utils::clip_grad_norm_(critic_->parameters(), 1.0); 
             for (auto& param : critic_->parameters()) {
                 if (param.grad().defined()) {
-                    param.grad().clamp_(-1.0, 1.0); // clipping gradients
+                    param.grad().clamp_(-1.0, 1.0); 
                 }
             }
-
             critic_opt_.step();
         }
+
         // Actor update
         {
-            std::unique_lock<std::shared_mutex> lk(actor_rw_);
             auto actor_loss = -critic_->forward(s, actor_->forward(s)).mean();
             a_loss_val = actor_loss.template item<float>();
             
             actor_opt_.zero_grad(); 
             actor_loss.backward(); 
 
-            // Gradient clipping for actor
-            // torch::nn::utils::clip_grad_norm_(actor_->parameters(), 1.0); 
             for (auto& param : actor_->parameters()) {
                 if (param.grad().defined()) {
-                    param.grad().clamp_(-1.0, 1.0); // clipping gradients
+                    param.grad().clamp_(-1.0, 1.0); 
                 }
             }
-
             actor_opt_.step();
 
-            // Soft updates
+            // Target networks soft update
             torch::NoGradGuard ng;
             auto update_fn = [&](auto& target, auto& source) {
                 auto tgt = target->named_parameters();
@@ -286,11 +289,6 @@ public:
         avg_reward /= rv.size();
         
         return {a_loss_val, c_loss_val, avg_q, avg_reward};
-        //return {a_loss_val, c_loss_val};
-    }
-
-    void reset_noise() {
-        noise_.reset();
     }
 
 private:
@@ -298,7 +296,5 @@ private:
     Critic critic_, critic_target_;
     torch::optim::Adam actor_opt_, critic_opt_;
     double tau_, gamma_;
-    std::shared_mutex actor_rw_;
-    OUNoise noise_;
-    bool use_noise_;
+    std::shared_mutex agent_mutex_; 
 };
