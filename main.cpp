@@ -16,6 +16,7 @@ void collect_worker(int                thread_id,
                     double             bandwidth,
                     int                vec_size,
                     int                max_steps,
+                    int                action_dim,
                     DDPG&              agent,
                     ReplayBuffer&      buffer,
                     std::atomic<bool>& stop_flag,
@@ -25,14 +26,35 @@ void collect_worker(int                thread_id,
     Environment env(num_users, num_ris, num_elements, bandwidth, vec_size);
     int episodes = 0;
 
+    // 1 OUNoise per env 
+    std::vector<OUNoise> noises;
+    noises.reserve(vec_size);
+    for (int b = 0; b < vec_size; ++b)
+        noises.emplace_back(action_dim); 
+
     while (!stop_flag.load(std::memory_order_relaxed)) {
         torch::Tensor state = env.reset();
+
+        // Reset each OU process at beginning of episode
+        for (auto& n : noises) n.reset();
+
         float ep_reward = 0.0f;
 
         for (int step = 0; step < max_steps; ++step) {
             if (stop_flag.load(std::memory_order_relaxed)) break;
 
-            torch::Tensor action = agent.select_action(state, true);  // with noise
+            // Derive [B, action_dim] noise tensor, different per env
+            std::vector<torch::Tensor> noise_rows;
+            noise_rows.reserve(vec_size);
+            for (int b = 0; b < vec_size; ++b) {
+                auto n_vec = noises[b].sample();   // [action_dim]
+                noise_rows.push_back(
+                    torch::tensor(n_vec, torch::kFloat).unsqueeze(0)  // [1, action_dim]
+                );
+            }
+            auto noise_batch = torch::cat(noise_rows, 0);  // [B, action_dim]
+
+            torch::Tensor action = agent.select_action(state, &noise_batch);  // with noise
             auto [next_state, reward, done] = env.step(action);
 
             for (int b = 0; b < vec_size; ++b) {
@@ -85,7 +107,9 @@ void train_worker(DDPG&              agent,
     std::cout << "[Trainer] Waiting for initial data (batch_size=" << batch_size << ")..." << std::endl;
 
     for (int i = 0; i < iterations && !stop_flag.load(std::memory_order_relaxed); ++i) {
-        auto batch = buffer.sample(static_cast<size_t>(batch_size));
+       //auto batch = buffer.sample(static_cast<size_t>(batch_size));
+       auto batch = buffer.sample(static_cast<size_t>(batch_size), stop_flag);
+        if (batch.empty()) break;
         TrainingMetrics metrics = agent.update(batch);
 
         if (i % log_every == 0) {
@@ -105,6 +129,7 @@ void train_worker(DDPG&              agent,
     }
 
     stop_flag.store(true, std::memory_order_relaxed);
+    buffer.notify_stop();
     std::cout << "[Trainer] Finished training." << std::endl;
 }
 
@@ -119,14 +144,14 @@ int main() {
     constexpr int vec_size        = 4;    // sub-environments per collector
     constexpr int max_steps       = 50;   // steps per episode
 
-    constexpr int    train_iters  = 2000;
-    constexpr int    batch_size   = 64;
+    constexpr int    train_iters  = 10000;
+    constexpr int    batch_size   = 256;
     constexpr int    log_every    = 50;
-    constexpr size_t buf_capacity = 20000;
+    constexpr size_t buf_capacity = 50000;
 
     Environment  probe(num_users, num_ris, num_elements, bandwidth);
     DDPG         agent(probe.state_dim, probe.action_dim,
-                       5e-5, 1e-4, 1e-3, 0.99); // 1e-3, 1e-3, 5e-3, 0.99); slower actor
+                       5e-6, 1e-4, 5e-4, 0.99); // 1e-3, 1e-3, 5e-3, 0.99); slower actor
     ReplayBuffer buffer(buf_capacity);
     std::atomic<bool> stop_flag{false};
     std::atomic<float> episode_reward_sum{0.0f};
@@ -145,6 +170,7 @@ int main() {
                                 t,
                                 num_users, num_ris, num_elements, bandwidth,
                                 vec_size, max_steps,
+                                probe.action_dim,
                                 std::ref(agent),
                                 std::ref(buffer),
                                 std::ref(stop_flag),
